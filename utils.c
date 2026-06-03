@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
@@ -13,6 +14,9 @@
 #include <math.h>
 #include <time.h>
 #include <pthread.h>
+#include <sched.h>
+#include <unistd.h>
+#include <errno.h>
 
 typedef struct {
     const Matrix *left;
@@ -20,10 +24,30 @@ typedef struct {
     Matrix *out;
     size_t block_begin;
     size_t block_end;
+    int thread_id;
+    int core_id;
 } WorkerArgs;
+
+static pthread_mutex_t print_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static size_t min_size(size_t a, size_t b) {
     return a < b ? a : b;
+}
+
+static int pin_current_thread_to_core(int core_id) {
+    if (core_id < 0) {
+        return EINVAL;
+    }
+
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET((size_t)core_id, &cpuset);
+
+    return pthread_setaffinity_np(
+        pthread_self(),
+        sizeof(cpu_set_t),
+        &cpuset
+    );
 }
 
 static size_t element_size(DataType dtype) {
@@ -276,6 +300,33 @@ static int matmul_sequential_once(const Matrix *left, const Matrix *right, Matri
 static void *worker_matmul(void *arg) {
     WorkerArgs *w = (WorkerArgs *) arg;
 
+    int pin_result = pin_current_thread_to_core(w->core_id);
+    int running_core = sched_getcpu();
+
+    pthread_mutex_lock(&print_mutex);
+
+    if (pin_result == 0) {
+        printf(
+            "[Pinning] Thread %d SUCCESS: requested logical CPU %d, running on logical CPU %d, blocks [%zu, %zu)\n",
+            w->thread_id,
+            w->core_id,
+            running_core,
+            w->block_begin,
+            w->block_end
+        );
+    } else {
+        printf(
+            "[Pinning] Thread %d FAILED: requested logical CPU %d, error = %s, blocks [%zu, %zu)\n",
+            w->thread_id,
+            w->core_id,
+            strerror(pin_result),
+            w->block_begin,
+            w->block_end
+        );
+    }
+
+    pthread_mutex_unlock(&print_mutex);
+
     const Matrix *left = w->left;
     const Matrix *right = w->right;
     Matrix *out = w->out;
@@ -356,6 +407,11 @@ static int matmul_parallel_once(const Matrix *left, const Matrix *right, Matrix 
     size_t num_block_cols = (cols + BLOCK_COLS - 1) / BLOCK_COLS;
     size_t total_blocks = num_block_rows * num_block_cols;
 
+    long available_cpus = sysconf(_SC_NPROCESSORS_ONLN);
+    if (available_cpus < 1) {
+        available_cpus = 1;
+    }
+
     pthread_t *tids = (pthread_t *) malloc((size_t)threads * sizeof(pthread_t));
     WorkerArgs *args = (WorkerArgs *) malloc((size_t)threads * sizeof(WorkerArgs));
 
@@ -374,6 +430,8 @@ static int matmul_parallel_once(const Matrix *left, const Matrix *right, Matrix 
         args[t].out = out;
         args[t].block_begin = block_begin;
         args[t].block_end = block_end;
+        args[t].thread_id = t;
+        args[t].core_id = t % (int)available_cpus;
 
         if (pthread_create(&tids[t], NULL, worker_matmul, &args[t]) != 0) {
             for (int j = 0; j < t; j++) {
