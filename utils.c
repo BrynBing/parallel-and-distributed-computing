@@ -2,6 +2,8 @@
 #define _DEFAULT_SOURCE
 #define _POSIX_C_SOURCE 200809L
 
+#define PRINT_PINNING 0
+
 #define BLOCK_ROWS 32
 #define BLOCK_COLS 32
 
@@ -300,6 +302,7 @@ static int matmul_sequential_once(const Matrix *left, const Matrix *right, Matri
 static void *worker_matmul(void *arg) {
     WorkerArgs *w = (WorkerArgs *) arg;
 
+#if PRINT_PINNING
     int pin_result = pin_current_thread_to_core(w->core_id);
     int running_core = sched_getcpu();
 
@@ -326,6 +329,11 @@ static void *worker_matmul(void *arg) {
     }
 
     pthread_mutex_unlock(&print_mutex);
+#else
+    if (w->core_id >= 0) {
+        pin_current_thread_to_core(w->core_id);
+    }
+#endif
 
     const Matrix *left = w->left;
     const Matrix *right = w->right;
